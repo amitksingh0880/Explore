@@ -203,16 +203,26 @@ export default function DashboardScreen() {
             countdownTrip ? (
               <View style={styles.countdown}>
                 <View style={styles.countdownLeft}>
-                  <Text style={styles.countdownEmoji}>
-                    {countdownTrip.days === 0 ? '\uD83D\uDE80' : countdownTrip.days <= 3 ? '\uD83D\uDD25' : '\u2708\uFE0F'}
-                  </Text>
-                  <View>
-                    <Text style={styles.countdownTitle}>{countdownTrip.title}</Text>
-                    <Text style={styles.countdownSub}>{countdownTrip.destination}</Text>
+                  <View style={styles.countdownIconBox}>
+                    <MaterialCommunityIcons
+                      name={
+                        countdownTrip.days === 0
+                          ? 'rocket-launch'
+                          : countdownTrip.days <= 3
+                          ? 'fire'
+                          : 'airplane'
+                      }
+                      size={22}
+                      color={Colors.primary}
+                    />
+                  </View>
+                  <View style={{ flex: 1 }}>
+                    <Text style={styles.countdownTitle} numberOfLines={1}>{countdownTrip.title}</Text>
+                    <Text style={styles.countdownSub} numberOfLines={1}>{countdownTrip.destination}</Text>
                   </View>
                 </View>
                 <View style={styles.countdownRight}>
-                  <Text style={styles.countdownDays}>
+                  <Text style={styles.countdownDays} numberOfLines={1}>
                     {countdownTrip.days === 0 ? 'TODAY!' : countdownTrip.days.toString()}
                   </Text>
                   {countdownTrip.days > 0 && <Text style={styles.countdownDaysLabel}>days to go</Text>}
@@ -376,12 +386,17 @@ const styles = StyleSheet.create({
     borderColor: Colors.neutral900,
     ...Shadow.md,
   },
-  countdownLeft: { flexDirection: 'row', alignItems: 'center', gap: Space[3], flex: 1 },
-  countdownEmoji: { fontSize: 32 },
-  countdownTitle: { fontFamily: FontFamily.bold, fontSize: FontSize.md, color: Colors.white, flexShrink: 1 },
+  countdownLeft: { flexDirection: 'row', alignItems: 'center', gap: Space[3], flex: 1, overflow: 'hidden', marginRight: Space[3] },
+  countdownIconBox: {
+    width: 44, height: 44, borderRadius: Radius.full,
+    backgroundColor: 'rgba(255,255,255,0.12)',
+    alignItems: 'center', justifyContent: 'center',
+    flexShrink: 0,
+  },
+  countdownTitle: { fontFamily: FontFamily.bold, fontSize: FontSize.md, color: Colors.white },
   countdownSub: { fontFamily: FontFamily.medium, fontSize: FontSize.xs, color: Colors.neutral400, marginTop: 2 },
-  countdownRight: { alignItems: 'center' },
-  countdownDays: { fontFamily: FontFamily.bold, fontSize: 40, color: Colors.primary, lineHeight: 40 },
+  countdownRight: { alignItems: 'center', flexShrink: 0, minWidth: 64 },
+  countdownDays: { fontFamily: FontFamily.bold, fontSize: 32, color: Colors.primary, lineHeight: 36 },
   countdownDaysLabel: { fontFamily: FontFamily.medium, fontSize: FontSize.xs, color: Colors.neutral400, marginTop: 2 },
 
   // FAB
