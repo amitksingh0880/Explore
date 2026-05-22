@@ -11,6 +11,7 @@ import {
   Image,
   Linking,
   TextInput,
+  Animated,
 } from 'react-native';
 import { MaterialCommunityIcons } from '@expo/vector-icons';
 import { SafeAreaView } from 'react-native-safe-area-context';
@@ -19,8 +20,32 @@ import { Colors, FontFamily, FontSize, Radius, Shadow, Space, StopTypeConfig } f
 import { Badge } from '../../components/ui/Badge';
 import { Card } from '../../components/ui/Card';
 import { useWanderPlanStore } from '../../db/store';
+import * as Haptics from 'expo-haptics';
+import AsyncStorage from '@react-native-async-storage/async-storage';
+import * as Print from 'expo-print';
+import * as Sharing from 'expo-sharing';
+import * as Notifications from 'expo-notifications';
 
-// ─── Weather helpers ───────────────────────────────────────────────
+// ─── Cache helpers ────────────────────────────────────────────────────────────
+const CACHE_TTL_MS = 6 * 60 * 60 * 1000; // 6 hours
+
+async function readCache<T>(key: string): Promise<T | null> {
+  try {
+    const raw = await AsyncStorage.getItem(key);
+    if (!raw) return null;
+    const { ts, data } = JSON.parse(raw) as { ts: number; data: T };
+    if (Date.now() - ts > CACHE_TTL_MS) return null; // expired
+    return data;
+  } catch { return null; }
+}
+
+async function writeCache<T>(key: string, data: T): Promise<void> {
+  try {
+    await AsyncStorage.setItem(key, JSON.stringify({ ts: Date.now(), data }));
+  } catch { /* ignore storage errors */ }
+}
+// ─────────────────────────────────────────────────────────────────────────────
+
 const WMO_CODES: Record<number, { label: string; icon: string }> = {
   0: { label: 'Clear sky', icon: 'weather-sunny' },
   1: { label: 'Mainly clear', icon: 'weather-sunny' },
@@ -47,6 +72,9 @@ interface WeatherData {
 }
 
 async function fetchWeather(destination: string): Promise<WeatherData | null> {
+  const cacheKey = `wx:${destination}`;
+  const cached = await readCache<WeatherData>(cacheKey);
+  if (cached) return cached;
   try {
     // Step 1: Geocode destination
     const geoRes = await fetch(
@@ -66,7 +94,7 @@ async function fetchWeather(destination: string): Promise<WeatherData | null> {
     const cur = wxData.current;
     const code = cur.weather_code as number;
     const meta = WMO_CODES[code] ?? { label: 'Unknown', icon: 'weather-cloudy' };
-    return {
+    const result: WeatherData = {
       temp: Math.round(cur.temperature_2m),
       code,
       label: meta.label,
@@ -74,6 +102,8 @@ async function fetchWeather(destination: string): Promise<WeatherData | null> {
       humidity: cur.relative_humidity_2m,
       wind: Math.round(cur.wind_speed_10m),
     };
+    await writeCache(cacheKey, result);
+    return result;
   } catch {
     return null;
   }
@@ -86,6 +116,130 @@ const NAV_TABS = [
   { key: 'contacts', icon: 'contacts-outline', label: 'Contacts' },
   { key: 'packing', icon: 'bag-checked', label: 'Packing' },
 ];
+
+// ─── Notifications ────────────────────────────────────────────────
+async function scheduleTripNotifications(tripId: string, title: string, destination: string, startDateStr: string) {
+  try {
+    const { status } = await Notifications.requestPermissionsAsync();
+    if (status !== 'granted') return;
+
+    // Cancel old notifications for this trip first
+    const scheduled = await Notifications.getAllScheduledNotificationsAsync();
+    for (const n of scheduled) {
+      if ((n.content.data as any)?.tripId === tripId) {
+        await Notifications.cancelScheduledNotificationAsync(n.identifier);
+      }
+    }
+
+    // Parse date (format: DD/MM/YYYY)
+    let startDate: Date;
+    if (startDateStr.includes('/')) {
+      const [d, m, y] = startDateStr.split('/').map(Number);
+      startDate = new Date(y, m - 1, d);
+    } else {
+      startDate = new Date(startDateStr);
+    }
+    if (isNaN(startDate.getTime())) return;
+
+    const now = new Date();
+    const msPerDay = 86_400_000;
+    const daysUntil = Math.ceil((startDate.getTime() - now.getTime()) / msPerDay);
+    if (daysUntil <= 0) return;
+
+    const schedule = [
+      { days: 7, msg: `Your trip to ${destination} starts in 1 week! Time to pack! 🧳` },
+      { days: 1, msg: `Your trip to ${destination} is TOMORROW! Are you ready? 🚀` },
+      { days: 0, msg: `Have an amazing trip to ${destination}! ✈️ Today is the day!` },
+    ];
+
+    for (const { days, msg } of schedule) {
+      if (daysUntil > days) {
+        const triggerDate = new Date(startDate.getTime() - days * msPerDay);
+        triggerDate.setHours(9, 0, 0, 0); // 9 AM
+        if (triggerDate > now) {
+          await Notifications.scheduleNotificationAsync({
+            content: {
+              title: `WanderPlan — ${title}`,
+              body: msg,
+              data: { tripId },
+            },
+            trigger: { date: triggerDate } as any,
+          });
+        }
+      }
+    }
+  } catch (e) {
+    console.warn('Notifications not available:', e);
+  }
+}
+
+// ─── PDF Export ───────────────────────────────────────────────────
+function buildItineraryHTML(trip: any, days: any[], stopsByDay: Record<string, any[]>): string {
+  const dayRows = days.map((day) => {
+    const stops = stopsByDay[day.id] ?? [];
+    const stopRows = stops.map((s) => `
+      <tr>
+        <td style="padding:6px 10px;font-size:12px;color:#555;width:70px">${s.time ?? '—'}</td>
+        <td style="padding:6px 10px;font-size:13px;font-weight:600;color:#111">${s.name}</td>
+        <td style="padding:6px 10px;font-size:12px;color:#888;text-transform:capitalize">${s.type}</td>
+        <td style="padding:6px 10px;font-size:12px;color:#111;text-align:right">${s.cost > 0 ? trip.currency + s.cost.toLocaleString() : '—'}</td>
+      </tr>
+    `).join('');
+
+    return `
+      <div style="margin-bottom:24px;border:2px solid #111;border-radius:12px;overflow:hidden">
+        <div style="background:#f5f5f5;padding:10px 14px;border-bottom:2px solid #111;display:flex;justify-content:space-between">
+          <span style="font-weight:700;font-size:15px">Day ${day.day_number} — ${day.title || ''}</span>
+          <span style="font-size:12px;color:#888">${day.date || ''} · ${day.weather || ''}</span>
+        </div>
+        ${stops.length === 0
+          ? '<p style="padding:12px 14px;color:#aaa;font-size:12px">No stops planned.</p>'
+          : `<table style="width:100%;border-collapse:collapse">${stopRows}</table>`
+        }
+      </div>
+    `;
+  }).join('');
+
+  const totalCost = Object.values(stopsByDay).flat().reduce((a, s) => a + (s.cost ?? 0), 0);
+
+  return `<!DOCTYPE html><html><head><meta charset="utf-8"/>
+  <style>
+    body { font-family: -apple-system, Helvetica, Arial, sans-serif; margin: 0; padding: 32px; color: #111; }
+    h1 { font-size: 28px; font-weight: 900; margin: 0 0 4px; }
+    .sub { font-size: 14px; color: #666; margin-bottom: 24px; }
+    .stat-row { display: flex; gap: 24px; margin-bottom: 28px; }
+    .stat { background: #f5f5f5; border-radius: 10px; padding: 12px 18px; border: 2px solid #111; }
+    .stat-val { font-size: 20px; font-weight: 700; }
+    .stat-lab { font-size: 11px; color: #666; text-transform: uppercase; letter-spacing: 0.5px; }
+    .footer { margin-top: 32px; font-size: 11px; color: #aaa; text-align: center; border-top: 1px solid #eee; padding-top: 16px; }
+  </style>
+</head><body>
+  <h1>${trip.title}</h1>
+  <p class="sub">📍 ${trip.destination} &nbsp;·&nbsp; 📅 ${trip.start_date} – ${trip.end_date} &nbsp;·&nbsp; ${trip.total_days} days</p>
+  <div class="stat-row">
+    <div class="stat"><div class="stat-val">${trip.currency}${trip.spent_budget.toLocaleString()}</div><div class="stat-lab">Spent</div></div>
+    <div class="stat"><div class="stat-val">${trip.currency}${trip.total_budget.toLocaleString()}</div><div class="stat-lab">Budget</div></div>
+    <div class="stat"><div class="stat-val">${trip.travelers}</div><div class="stat-lab">Travelers</div></div>
+  </div>
+  ${dayRows}
+  <div class="footer">Generated by WanderPlan · Powered by open-source tools · ${new Date().toLocaleDateString()}</div>
+</body></html>`;
+}
+
+async function exportAndSharePDF(trip: any, days: any[], stopsByDay: Record<string, any[]>) {
+  try {
+    const html = buildItineraryHTML(trip, days, stopsByDay);
+    const { uri } = await Print.printToFileAsync({ html, base64: false });
+    const canShare = await Sharing.isAvailableAsync();
+    if (canShare) {
+      await Sharing.shareAsync(uri, { mimeType: 'application/pdf', dialogTitle: `Share ${trip.title} Itinerary` });
+    } else {
+      Alert.alert('PDF Saved', `Itinerary saved to: ${uri}`);
+    }
+  } catch (e: any) {
+    Alert.alert('Export Failed', e.message ?? 'Could not generate PDF.');
+  }
+}
 
 // ─── Packing suggestions engine ────────────────────────────────────────────
 const BASE_ESSENTIALS = [
@@ -247,25 +401,37 @@ function useDestinationWiki(destination: string) {
   React.useEffect(() => {
     if (!destination) return;
     let cancelled = false;
-    setLoading(true);
-    setData(null);
+    const cacheKey = `wiki:${destination}`;
     const query = encodeURIComponent(destination.split(',')[0].trim());
-    fetch(
-      `https://en.wikipedia.org/api/rest_v1/page/summary/${query}`
-    )
-      .then((r) => (r.ok ? r.json() : null))
-      .then((json) => {
+
+    (async () => {
+      // Try cache first — show instantly without spinner
+      const cached = await readCache<WikiData>(cacheKey);
+      if (cached && !cancelled) {
+        setData(cached);
+        return; // no loading state needed
+      }
+
+      if (!cancelled) setLoading(true);
+      if (!cancelled) setData(null);
+
+      try {
+        const r = await fetch(`https://en.wikipedia.org/api/rest_v1/page/summary/${query}`);
+        const json = r.ok ? await r.json() : null;
         if (cancelled || !json) return;
-        setData({
+        const result: WikiData = {
           title: json.title ?? destination,
           description: json.description,
           extract: json.extract ?? '',
           thumbnail: json.thumbnail?.source,
           url: json.content_urls?.desktop?.page ?? `https://en.wikipedia.org/wiki/${query}`,
-        });
-      })
-      .catch(() => {})
-      .finally(() => { if (!cancelled) setLoading(false); });
+        };
+        setData(result);
+        await writeCache(cacheKey, result);
+      } catch { /* network error — cache miss is fine */ }
+      finally { if (!cancelled) setLoading(false); }
+    })();
+
     return () => { cancelled = true; };
   }, [destination]);
 
@@ -314,7 +480,9 @@ export default function TripDetailScreen() {
   const [addingAll, setAddingAll] = useState(false);
   const [weather, setWeather] = useState<WeatherData | null>(null);
   const [weatherLoading, setWeatherLoading] = useState(false);
+  const [exportingPDF, setExportingPDF] = useState(false);
   const weatherFetched = useRef(false);
+  const notifScheduled = useRef(false);
   const destWiki = useDestinationWiki(trip?.destination ?? '');
 
   // Currency Converter states
@@ -381,6 +549,14 @@ export default function TripDetailScreen() {
     }
   }, [trip?.destination]);
 
+  // Schedule departure notifications once per trip load
+  useEffect(() => {
+    if (trip?.start_date && trip?.id && !notifScheduled.current) {
+      notifScheduled.current = true;
+      scheduleTripNotifications(trip.id, trip.title, trip.destination, trip.start_date);
+    }
+  }, [trip?.id]);
+
   // Expand the first day automatically once loaded
   React.useEffect(() => {
     if (days.length > 0 && expandedDay === null) {
@@ -432,11 +608,26 @@ export default function TripDetailScreen() {
               <MaterialCommunityIcons name="arrow-left" size={24} color={Colors.neutral900} />
             </TouchableOpacity>
             <View style={styles.heroNavRight}>
-              <TouchableOpacity style={styles.navBtn}>
-                <MaterialCommunityIcons name="share-variant" size={24} color={Colors.neutral900} />
+              <TouchableOpacity
+                style={styles.navBtn}
+                disabled={exportingPDF}
+                onPress={async () => {
+                  if (!trip) return;
+                  setExportingPDF(true);
+                  await exportAndSharePDF(trip, days, stopsByDay);
+                  setExportingPDF(false);
+                }}
+              >
+                {exportingPDF
+                  ? <ActivityIndicator size="small" color={Colors.primary} />
+                  : <MaterialCommunityIcons name="share-variant" size={24} color={Colors.neutral900} />
+                }
               </TouchableOpacity>
-              <TouchableOpacity style={styles.navBtn}>
-                <MaterialCommunityIcons name="dots-vertical" size={24} color={Colors.neutral900} />
+              <TouchableOpacity
+                style={styles.navBtn}
+                onPress={() => router.push(`/trip/map/${trip?.id}`)}
+              >
+                <MaterialCommunityIcons name="map-marker-path" size={24} color={Colors.primary} />
               </TouchableOpacity>
             </View>
           </View>
@@ -669,8 +860,9 @@ export default function TripDetailScreen() {
                   <Text style={styles.budgetItemLabel}>Total</Text>
                 </View>
               </View>
-              <Text style={[styles.sectionTitle, { marginTop: Space[5] }]}>Cost Attributions</Text>
-              <Text style={styles.emptyText}>All accommodation bookings and activity admission costs contribute directly to your remaining budget calculations.</Text>
+
+              {/* ── Animated Budget Breakdown Chart ── */}
+              <BudgetBreakdownChart stopsByDay={stopsByDay} currency={trip.currency} />
             </Card>
 
             {/* Currency Converter Card */}
@@ -875,7 +1067,10 @@ export default function TripDetailScreen() {
                       <View style={{ flexDirection: 'row', gap: Space[2] }}>
                         <TouchableOpacity
                           style={[styles.journeyConfirmBtn, node.is_confirmed && styles.journeyConfirmBtnActive]}
-                          onPress={() => confirmJourneyNode(node.id, !node.is_confirmed)}
+                          onPress={() => {
+                            Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
+                            confirmJourneyNode(node.id, !node.is_confirmed);
+                          }}
                         >
                           <MaterialCommunityIcons
                             name={node.is_confirmed ? 'check-circle' : 'circle-outline'}
@@ -1125,6 +1320,7 @@ export default function TripDetailScreen() {
                         notes: newNodeNotes.trim() || null,
                         is_confirmed: false,
                       });
+                      Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
                       setSavingNode(false);
                       setShowNodeModal(false);
                     }}
@@ -1309,7 +1505,10 @@ export default function TripDetailScreen() {
                   {packingItems.map((item) => (
                     <TouchableOpacity
                       key={item.id}
-                      onPress={() => togglePackItem(item.id, item.is_packed)}
+                      onPress={() => {
+                        Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
+                        togglePackItem(item.id, item.is_packed);
+                      }}
                       style={{ flexDirection: 'row', alignItems: 'center', gap: Space[3], paddingVertical: Space[1] }}
                     >
                       <MaterialCommunityIcons
@@ -1337,6 +1536,79 @@ export default function TripDetailScreen() {
 
         <View style={{ height: Space[10] }} />
       </ScrollView>
+    </View>
+  );
+}
+
+// ─── Budget Breakdown Chart ────────────────────────────────────────────────────
+function BudgetBreakdownChart({ stopsByDay, currency }: { stopsByDay: Record<string, any[]>; currency: string }) {
+  const allStops = Object.values(stopsByDay).flat();
+  const byType: Record<string, number> = {};
+
+  for (const stop of allStops) {
+    if (stop.cost > 0) {
+      byType[stop.type] = (byType[stop.type] ?? 0) + stop.cost;
+    }
+  }
+
+  const entries = Object.entries(byType).sort((a, b) => b[1] - a[1]);
+  const maxVal = entries[0]?.[1] ?? 1;
+
+  const animVals = useRef(entries.map(() => new Animated.Value(0))).current;
+
+  useEffect(() => {
+    const anims = animVals.map((v, i) =>
+      Animated.timing(v, {
+        toValue: entries[i]?.[1] ?? 0,
+        duration: 600 + i * 100,
+        delay: i * 80,
+        useNativeDriver: false,
+      })
+    );
+    Animated.stagger(60, anims).start();
+  }, [JSON.stringify(entries)]);
+
+  if (entries.length === 0) {
+    return (
+      <View style={{ marginTop: Space[4] }}>
+        <Text style={styles.sectionTitle}>Spending by Category</Text>
+        <Text style={styles.emptyText}>No costs recorded yet. Add costs to stops to see a breakdown.</Text>
+      </View>
+    );
+  }
+
+  return (
+    <View style={{ marginTop: Space[5] }}>
+      <Text style={styles.sectionTitle}>Spending by Category</Text>
+      <View style={{ gap: Space[3] }}>
+        {entries.map(([type, value], i) => {
+          const cfg = StopTypeConfig[type as keyof typeof StopTypeConfig] ?? StopTypeConfig.activity;
+          const widthPct = animVals[i].interpolate({
+            inputRange: [0, maxVal],
+            outputRange: ['0%', '100%'],
+            extrapolate: 'clamp',
+          });
+          return (
+            <View key={type} style={styles.chartRow}>
+              <View style={[styles.chartTypeIcon, { backgroundColor: cfg.bg }]}>
+                <MaterialCommunityIcons name={cfg.icon as any} size={14} color={cfg.color} />
+              </View>
+              <View style={styles.chartBarWrap}>
+                <View style={styles.chartBarTrack}>
+                  <Animated.View
+                    style={[
+                      styles.chartBarFill,
+                      { width: widthPct, backgroundColor: cfg.color },
+                    ]}
+                  />
+                </View>
+                <Text style={styles.chartLabel} numberOfLines={1}>{type.charAt(0).toUpperCase() + type.slice(1)}</Text>
+              </View>
+              <Text style={styles.chartValue}>{currency}{value.toLocaleString()}</Text>
+            </View>
+          );
+        })}
+      </View>
     </View>
   );
 }
@@ -1486,6 +1758,22 @@ const styles = StyleSheet.create({
   budgetValue: { fontFamily: FontFamily.bold, fontSize: FontSize.lg, color: Colors.neutral900 },
   budgetItemLabel: { fontFamily: FontFamily.regular, fontSize: FontSize.xs, color: Colors.neutral400 },
   budgetDivider: { width: 1, backgroundColor: Colors.neutral100 },
+
+  // Budget breakdown chart
+  chartRow: { flexDirection: 'row', alignItems: 'center', gap: Space[3] },
+  chartTypeIcon: {
+    width: 30, height: 30, borderRadius: Radius.sm,
+    alignItems: 'center', justifyContent: 'center',
+    borderWidth: 2, borderColor: Colors.neutral900,
+  },
+  chartBarWrap: { flex: 1, gap: 3 },
+  chartBarTrack: {
+    height: 10, borderRadius: 5,
+    backgroundColor: Colors.neutral100, overflow: 'hidden',
+  },
+  chartBarFill: { height: '100%', borderRadius: 5 },
+  chartLabel: { fontFamily: FontFamily.medium, fontSize: 10, color: Colors.neutral400 },
+  chartValue: { fontFamily: FontFamily.bold, fontSize: FontSize.xs, color: Colors.neutral900, minWidth: 60, textAlign: 'right' },
 
   // Packing tab
   packingProgress: { gap: Space[1], marginBottom: Space[3] },
@@ -1811,7 +2099,7 @@ const styles = StyleSheet.create({
   journeyConnectorLine: {
     width: 2,
     flex: 1,
-    backgroundColor: Colors.neutral300,
+    backgroundColor: Colors.neutral200,
     borderStyle: 'dashed',
   },
 

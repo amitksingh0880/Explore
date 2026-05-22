@@ -9,6 +9,7 @@ import {
   Platform,
   Dimensions,
   FlatList,
+  RefreshControl,
 } from 'react-native';
 import { MaterialCommunityIcons } from '@expo/vector-icons';
 import { DrawerActions } from '@react-navigation/native';
@@ -51,12 +52,19 @@ export default function DashboardScreen() {
   const router = useRouter();
   const navigation = useNavigation();
   const [activeFilter, setActiveFilter] = useState<FilterTab>('all');
+  const [refreshing, setRefreshing] = useState(false);
   
   const trips = useWanderPlanStore((state) => state.trips);
   const refreshTrips = useWanderPlanStore((state) => state.refreshTrips);
 
   React.useEffect(() => {
     refreshTrips();
+  }, [refreshTrips]);
+
+  const onRefresh = React.useCallback(async () => {
+    setRefreshing(true);
+    await refreshTrips();
+    setRefreshing(false);
   }, [refreshTrips]);
 
   // Map db Trip model to TripCardData
@@ -199,6 +207,14 @@ export default function DashboardScreen() {
           showsVerticalScrollIndicator={false}
           ItemSeparatorComponent={() => <View style={{ height: Space[4] }} />}
           renderItem={({ item }) => <TripCard trip={item} />}
+          refreshControl={
+            <RefreshControl
+              refreshing={refreshing}
+              onRefresh={onRefresh}
+              tintColor={Colors.primary}
+              colors={[Colors.primary]}
+            />
+          }
           ListHeaderComponent={
             countdownTrip ? (
               <View style={styles.countdown}>
