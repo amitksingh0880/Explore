@@ -90,6 +90,28 @@ export async function initDatabase(): Promise<void> {
       category TEXT DEFAULT 'Other',
       FOREIGN KEY (trip_id) REFERENCES trips (id) ON DELETE CASCADE
     );
+
+    CREATE TABLE IF NOT EXISTS journey_nodes (
+      id TEXT PRIMARY KEY,
+      trip_id TEXT NOT NULL,
+      order_index INTEGER NOT NULL DEFAULT 0,
+      node_type TEXT NOT NULL DEFAULT 'stay',
+      location_name TEXT NOT NULL,
+      nights INTEGER DEFAULT 0,
+      stay_name TEXT,
+      room_number TEXT,
+      booking_ref TEXT,
+      check_in TEXT,
+      check_out TEXT,
+      transit_mode TEXT,
+      transit_from TEXT,
+      transit_to TEXT,
+      departure_time TEXT,
+      arrival_time TEXT,
+      notes TEXT,
+      is_confirmed INTEGER DEFAULT 0,
+      FOREIGN KEY (trip_id) REFERENCES trips (id) ON DELETE CASCADE
+    );
   `);
 
   // Insert mock data if trips table is completely empty
@@ -428,3 +450,116 @@ export async function getContacts(tripId: string): Promise<Contact[]> {
   const db = await getDatabase();
   return await db.getAllAsync<Contact>('SELECT * FROM contacts WHERE trip_id = ? ORDER BY name ASC;', [tripId]);
 }
+
+// Insert a single packing item
+export async function insertPackingItem(item: Omit<PackingItem, 'id' | 'is_packed'>): Promise<PackingItem> {
+  const db = await getDatabase();
+  const id = generateId();
+  await db.runAsync(
+    'INSERT INTO packing_items (id, trip_id, name, is_packed, category) VALUES (?, ?, ?, 0, ?);',
+    [id, item.trip_id, item.name, item.category]
+  );
+  return { id, trip_id: item.trip_id, name: item.name, is_packed: false, category: item.category };
+}
+
+// Bulk insert packing items (ignores duplicates by name+trip_id)
+export async function bulkInsertPackingItems(
+  tripId: string,
+  items: { name: string; category: string }[]
+): Promise<void> {
+  const db = await getDatabase();
+  for (const item of items) {
+    const exists = await db.getFirstAsync<{ count: number }>(
+      'SELECT COUNT(*) as count FROM packing_items WHERE trip_id = ? AND name = ?;',
+      [tripId, item.name]
+    );
+    if (!exists || exists.count === 0) {
+      const id = generateId();
+      await db.runAsync(
+        'INSERT INTO packing_items (id, trip_id, name, is_packed, category) VALUES (?, ?, ?, 0, ?);',
+        [id, tripId, item.name, item.category]
+      );
+    }
+  }
+}
+
+
+// ─── Journey Workflow (Pathway Planner) ────────────────────────────────────
+
+export interface JourneyNode {
+  id: string;
+  trip_id: string;
+  order_index: number;
+  node_type: string; // 'stay' | 'transit' | 'waypoint'
+  location_name: string;
+  nights: number;
+  stay_name: string | null;
+  room_number: string | null;
+  booking_ref: string | null;
+  check_in: string | null;
+  check_out: string | null;
+  transit_mode: string | null; // 'flight'|'train'|'bus'|'car'|'ferry'|'walk'
+  transit_from: string | null;
+  transit_to: string | null;
+  departure_time: string | null;
+  arrival_time: string | null;
+  notes: string | null;
+  is_confirmed: boolean;
+}
+
+export async function getJourneyNodes(tripId: string): Promise<JourneyNode[]> {
+  const db = await getDatabase();
+  const rows = await db.getAllAsync<any>(
+    'SELECT * FROM journey_nodes WHERE trip_id = ? ORDER BY order_index ASC;',
+    [tripId]
+  );
+  return rows.map((r) => ({ ...r, is_confirmed: r.is_confirmed === 1 }));
+}
+
+export async function insertJourneyNode(
+  node: Omit<JourneyNode, 'id'>
+): Promise<JourneyNode> {
+  const db = await getDatabase();
+  const id = generateId();
+  await db.runAsync(
+    `INSERT INTO journey_nodes (
+      id, trip_id, order_index, node_type, location_name,
+      nights, stay_name, room_number, booking_ref, check_in, check_out,
+      transit_mode, transit_from, transit_to, departure_time, arrival_time,
+      notes, is_confirmed
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);`,
+    [
+      id, node.trip_id, node.order_index, node.node_type, node.location_name,
+      node.nights, node.stay_name ?? null, node.room_number ?? null,
+      node.booking_ref ?? null, node.check_in ?? null, node.check_out ?? null,
+      node.transit_mode ?? null, node.transit_from ?? null, node.transit_to ?? null,
+      node.departure_time ?? null, node.arrival_time ?? null,
+      node.notes ?? null, node.is_confirmed ? 1 : 0,
+    ]
+  );
+  const row = await db.getFirstAsync<any>('SELECT * FROM journey_nodes WHERE id = ?;', [id]);
+  return { ...row, is_confirmed: row.is_confirmed === 1 };
+}
+
+export async function updateJourneyNode(
+  id: string,
+  updates: Partial<Omit<JourneyNode, 'id' | 'trip_id'>>
+): Promise<void> {
+  const db = await getDatabase();
+  const fields: string[] = [];
+  const values: any[] = [];
+  for (const [key, value] of Object.entries(updates)) {
+    fields.push(`${key} = ?`);
+    values.push(key === 'is_confirmed' ? (value ? 1 : 0) : (value ?? null));
+  }
+  if (fields.length === 0) return;
+  values.push(id);
+  await db.runAsync(`UPDATE journey_nodes SET ${fields.join(', ')} WHERE id = ?;`, values);
+}
+
+export async function deleteJourneyNode(id: string): Promise<void> {
+  const db = await getDatabase();
+  await db.runAsync('DELETE FROM journey_nodes WHERE id = ?;', [id]);
+}
+
+

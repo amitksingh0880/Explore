@@ -10,12 +10,18 @@ import {
   insertStop,
   getPackingItems,
   togglePackingItem,
+  bulkInsertPackingItems,
   getContacts,
+  getJourneyNodes,
+  insertJourneyNode,
+  updateJourneyNode,
+  deleteJourneyNode,
   Trip,
   Day,
   Stop,
   PackingItem,
   Contact,
+  JourneyNode,
 } from './database';
 
 interface WanderPlanState {
@@ -25,6 +31,7 @@ interface WanderPlanState {
   activeStopsByDay: Record<string, Stop[]>;
   activePackingItems: PackingItem[];
   activeContacts: Contact[];
+  activeJourneyNodes: JourneyNode[];
   isLoading: boolean;
   isInitialized: boolean;
 
@@ -36,6 +43,10 @@ interface WanderPlanState {
   removeTrip: (tripId: string) => Promise<void>;
   addStop: (stop: Omit<Stop, 'id'>) => Promise<void>;
   togglePackItem: (itemId: string, currentStatus: boolean) => Promise<void>;
+  bulkAddPackingItems: (tripId: string, items: { name: string; category: string }[]) => Promise<void>;
+  addJourneyNode: (node: Omit<JourneyNode, 'id'>) => Promise<void>;
+  removeJourneyNode: (nodeId: string) => Promise<void>;
+  confirmJourneyNode: (nodeId: string, confirmed: boolean) => Promise<void>;
 }
 
 export const useWanderPlanStore = create<WanderPlanState>((set, get) => ({
@@ -45,6 +56,7 @@ export const useWanderPlanStore = create<WanderPlanState>((set, get) => ({
   activeStopsByDay: {},
   activePackingItems: [],
   activeContacts: [],
+  activeJourneyNodes: [],
   isLoading: false,
   isInitialized: false,
 
@@ -92,6 +104,7 @@ export const useWanderPlanStore = create<WanderPlanState>((set, get) => ({
 
       const packingItems = await getPackingItems(tripId);
       const contacts = await getContacts(tripId);
+      const journeyNodes = await getJourneyNodes(tripId);
 
       set({
         activeTrip: trip,
@@ -99,6 +112,7 @@ export const useWanderPlanStore = create<WanderPlanState>((set, get) => ({
         activeStopsByDay: stopsByDay,
         activePackingItems: packingItems,
         activeContacts: contacts,
+        activeJourneyNodes: journeyNodes,
       });
     } catch (error) {
       console.error(`Failed to load details for trip ${tripId}:`, error);
@@ -185,6 +199,53 @@ export const useWanderPlanStore = create<WanderPlanState>((set, get) => ({
       }
     } catch (error) {
       console.error('Failed to toggle packing item:', error);
+    }
+  },
+
+  bulkAddPackingItems: async (tripId, items) => {
+    try {
+      await bulkInsertPackingItems(tripId, items);
+      const packingItems = await getPackingItems(tripId);
+      set({ activePackingItems: packingItems });
+    } catch (error) {
+      console.error('Failed to bulk add packing items:', error);
+    }
+  },
+
+  addJourneyNode: async (nodeData) => {
+    try {
+      await insertJourneyNode(nodeData);
+      const activeTrip = get().activeTrip;
+      if (activeTrip) {
+        const nodes = await getJourneyNodes(activeTrip.id);
+        set({ activeJourneyNodes: nodes });
+      }
+    } catch (error) {
+      console.error('Failed to add journey node:', error);
+    }
+  },
+
+  removeJourneyNode: async (nodeId) => {
+    try {
+      await deleteJourneyNode(nodeId);
+      set((state) => ({
+        activeJourneyNodes: state.activeJourneyNodes.filter((n) => n.id !== nodeId),
+      }));
+    } catch (error) {
+      console.error('Failed to remove journey node:', error);
+    }
+  },
+
+  confirmJourneyNode: async (nodeId, confirmed) => {
+    try {
+      await updateJourneyNode(nodeId, { is_confirmed: confirmed });
+      set((state) => ({
+        activeJourneyNodes: state.activeJourneyNodes.map((n) =>
+          n.id === nodeId ? { ...n, is_confirmed: confirmed } : n
+        ),
+      }));
+    } catch (error) {
+      console.error('Failed to confirm journey node:', error);
     }
   },
 }));
